@@ -569,6 +569,59 @@ struct Config {
     source: Option<ConfigSourceConfig>,
 }
 
+fn clamp_to_char_boundary(input: &str, mut index: usize) -> usize {
+    index = index.min(input.len());
+    while index > 0 && !input.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn format_toml_parse_error(config_str: &str, error: &toml::de::Error) -> String {
+    let mut message = "failed to parse config TOML".to_string();
+
+    if let Some(span) = error.span() {
+        let span_start = clamp_to_char_boundary(config_str, span.start);
+        let span_end = clamp_to_char_boundary(config_str, span.end);
+        let mut line_number = 1;
+        let mut line_start = 0;
+
+        for (idx, ch) in config_str.char_indices() {
+            if idx >= span_start {
+                break;
+            }
+            if ch == '\n' {
+                line_number += 1;
+                line_start = idx + ch.len_utf8();
+            }
+        }
+
+        let line_end = config_str[line_start..]
+            .find('\n')
+            .map(|offset| line_start + offset)
+            .unwrap_or(config_str.len());
+        let column_number = config_str[line_start..span_start].chars().count() + 1;
+        let underline_len = if span_end > span_start && span_end <= line_end {
+            config_str[span_start..span_end].chars().count().max(1)
+        } else {
+            1
+        };
+
+        message.push_str(&format!(
+            " at line {}, column {}\n{:>4} | {}\n     | {}{}",
+            line_number,
+            column_number,
+            line_number,
+            &config_str[line_start..line_end],
+            " ".repeat(column_number.saturating_sub(1)),
+            "^".repeat(underline_len.min(80)),
+        ));
+    }
+
+    message.push_str(&format!("\ndetail: {}", error));
+    message
+}
+
 #[derive(Debug, Clone)]
 pub struct TomlConfigLoader {
     config: Arc<Mutex<Config>>,
@@ -592,7 +645,7 @@ impl TomlConfigLoader {
 
     pub fn new_from_str(config_str: &str) -> Result<Self, anyhow::Error> {
         let mut config = toml::de::from_str::<Config>(config_str)
-            .with_context(|| format!("failed to parse config file: {}", config_str))?;
+            .map_err(|err| anyhow::anyhow!(format_toml_parse_error(config_str, &err)))?;
 
         Self::normalize_config_source(&mut config);
 
@@ -634,7 +687,8 @@ impl TomlConfigLoader {
     pub fn new(config_path: &PathBuf) -> Result<Self, anyhow::Error> {
         let config_str = std::fs::read_to_string(config_path)
             .with_context(|| format!("failed to read config file: {:?}", config_path))?;
-        let ret = Self::new_from_str(&config_str)?;
+        let ret = Self::new_from_str(&config_str)
+            .with_context(|| format!("config source: {:?}", config_path))?;
 
         Ok(ret)
     }
@@ -1204,7 +1258,7 @@ pub async fn load_config_from_file(
             .read_to_string(&mut stdin)
             .await
             .context("failed to read config from stdin")?;
-        let config = TomlConfigLoader::new_from_str(&stdin)?;
+        let config = TomlConfigLoader::new_from_str(&stdin).context("config source: stdin")?;
         return Ok((config, ConfigFileControl::STATIC_CONFIG));
     }
 
@@ -1272,6 +1326,32 @@ pub mod tests {
     use std::io::Write;
     use std::path::PathBuf;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn invalid_toml_error_includes_location_and_source_line() {
+        let error = TomlConfigLoader::new_from_str("dhcp = \"yes\"")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("failed to parse config TOML"));
+        assert!(error.contains("line 1, column"));
+        assert!(error.contains("dhcp = \"yes\""));
+        assert!(error.contains("^"));
+        assert!(error.contains("detail:"));
+    }
+
+    #[test]
+    fn invalid_file_toml_error_includes_config_source() {
+        let mut config_file = NamedTempFile::new().unwrap();
+        writeln!(config_file, "dhcp = \"yes\"").unwrap();
+
+        let error = TomlConfigLoader::new(&config_file.path().to_path_buf()).unwrap_err();
+        let error = format!("{error:?}");
+
+        assert!(error.contains("config source:"));
+        assert!(error.contains(config_file.path().to_string_lossy().as_ref()));
+        assert!(error.contains("failed to parse config TOML"));
+    }
 
     #[test]
     fn socket_mark_config_file_roundtrip_none_some_and_zero() {
